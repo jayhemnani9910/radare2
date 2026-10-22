@@ -168,6 +168,7 @@ static int oprep(RArchSession *a, ut8 *data, const Opcode *op);
 static int op_reg_mem(int bits, ut8 *data, const Operand *reg, const Operand *mem, ut8 opcode);
 static bool use_op_reg_mem(int bits, const Operand *mem);
 static int op_rm_ext(int bits, ut8 *data, const Operand *rm, int ext, ut8 opcode8, ut8 opcode);
+static int op_rm_near(int bits, ut8 *data, const Operand *rm, int ext, ut8 opcode);
 
 // Minimal VEX.3 prefix emission for selected BMI2 GPR ops (SHLX/SHRX/SARX)
 // Encodes: VEX.NDS.LZ.0F38.Wx with computed R', X', B', vvvv'
@@ -1448,6 +1449,9 @@ static int opcall(RArchSession *a, ut8 *data, const Opcode *op) {
 	int offset = 0;
 	int mod = 0;
 
+	if ((op->operands[0].type & OT_GPREG) && a->config->bits != 16) {
+		return op_rm_near (a->config->bits, data, &op->operands[0], 2, 0xff);
+	}
 	if ((op->operands[0].type & OT_GPREG) && !(op->operands[0].type & OT_MEMORY)) {
 		if (op->operands[0].reg == X86R_UNDEFINED) {
 			return -1;
@@ -1791,6 +1795,9 @@ static int opdec(RArchSession *a, ut8 *data, const Opcode *op) {
 		return -1;
 	}
 	is_valid_registers (op);
+	if ((op->operands[0].type & OT_MEMORY) && a->config->bits != 16) {
+		return op_rm_ext (a->config->bits, data, &op->operands[0], 1, 0xfe, 0xff);
+	}
 	int l = 0;
 	int size = op->operands[0].type & ALL_SIZE;
 	if (op->operands[0].explicit_size) {
@@ -2217,6 +2224,9 @@ static int opinc(RArchSession *a, ut8 *data, const Opcode *op) {
 		return -1;
 	}
 	is_valid_registers (op);
+	if ((op->operands[0].type & OT_MEMORY) && a->config->bits != 16) {
+		return op_rm_ext (a->config->bits, data, &op->operands[0], 0, 0xfe, 0xff);
+	}
 	int l = 0;
 	int size = op->operands[0].type & ALL_SIZE;
 	if (op->operands[0].explicit_size) {
@@ -2393,6 +2403,10 @@ static int openter(RArchSession *a, ut8 *data, const Opcode *op) {
 static int opjc(RArchSession *a, ut8 *data, const Opcode *op) {
 	is_valid_registers (op);
 	int l = 0;
+	// before the rel32 range check: a memory operand's offset shares storage with the immediate
+	if (!strcmp (op->mnemonic, "jmp") && (op->operands[0].type & OT_GPREG) && a->config->bits != 16) {
+		return op_rm_near (a->config->bits, data, &op->operands[0], 4, 0xff);
+	}
 	bool is_short = op->is_short;
 	// st64 bigimm = op->operands[0].immediate * op->operands[0].sign;
 	st64 immediate = op->operands[0].immediate * op->operands[0].sign;
@@ -2712,6 +2726,27 @@ static int op_rm_ext(int bits, ut8 *data, const Operand *rm, int ext, ut8 opcode
 	data[l++] = (size == OT_BYTE)? opcode8: opcode;
 	memcpy (data + l, modrm, n);
 	return l + n;
+}
+
+// push, pop, call and jmp with a register or memory operand: the stack width needs no REX.W
+static int op_rm_near(int bits, ut8 *data, const Operand *rm, int ext, ut8 opcode) {
+	const ut32 near = (bits == 64)? OT_QWORD: OT_DWORD;
+	ut32 size = (rm->type & OT_MEMORY)? (rm->dest_size & ALL_SIZE): (rm->type & ALL_SIZE);
+	if (!size && (rm->type & OT_MEMORY)) {
+		size = near;
+	}
+	if (bits == 64 && size == OT_DWORD && !(rm->type & OT_MEMORY)) {
+		size = near; // call eax has always meant call rax here
+	}
+	if (size != near && size != OT_WORD) {
+		return -1;
+	}
+	Operand o = *rm;
+	if (size == near) {
+		o.type = (o.type & ~ALL_SIZE) | OT_DWORD;
+		o.dest_size = OT_DWORD;
+	}
+	return op_rm_ext (bits, data, &o, ext, opcode, opcode);
 }
 
 // bt, bts, btr and btc: r/m with a bit index in a register (0F A3/AB/B3/BB /r) or an imm8 (0F BA /4-/7)
@@ -3524,6 +3559,9 @@ static int oppop(RArchSession *a, ut8 *data, const Opcode *op) {
 			}
 			data[l++] = base + (8 * op->operands[0].reg);
 		} else {
+			if ((op->operands[0].type & OT_WORD) && a->config->bits != 16) {
+				data[l++] = 0x66;
+			}
 			if (op->operands[0].extended && a->config->bits == 64) {
 				data[l++] = 0x41;
 			}
@@ -3531,6 +3569,9 @@ static int oppop(RArchSession *a, ut8 *data, const Opcode *op) {
 			data[l++] = base + op->operands[0].reg;
 		}
 	} else if (op->operands[0].type & OT_MEMORY) {
+		if (a->config->bits != 16) {
+			return op_rm_near (a->config->bits, data, &op->operands[0], 0, 0x8f);
+		}
 		data[l++] = 0x8f;
 		offset = op->operands[0].offset * op->operands[0].offset_sign;
 		if (offset != 0 || op->operands[0].regs[0] == X86R_EBP) {
@@ -3577,6 +3618,9 @@ static int oppush(RArchSession *a, ut8 *data, const Opcode *op) {
 			}
 			data[l++] = base + (8 * op->operands[0].reg);
 		} else {
+			if ((op->operands[0].type & OT_WORD) && a->config->bits != 16) {
+				data[l++] = 0x66;
+			}
 			if (op->operands[0].extended && a->config->bits == 64) {
 				data[l++] = 0x41;
 			}
@@ -3588,6 +3632,9 @@ static int oppush(RArchSession *a, ut8 *data, const Opcode *op) {
 			data[l++] = base + op->operands[0].reg;
 		}
 	} else if (op->operands[0].type & OT_MEMORY) {
+		if (a->config->bits != 16) {
+			return op_rm_near (a->config->bits, data, &op->operands[0], 6, 0xff);
+		}
 		data[l++] = 0xff;
 		offset = op->operands[0].offset * op->operands[0].offset_sign;
 		if (offset != 0 || op->operands[0].regs[0] == X86R_EBP) {
